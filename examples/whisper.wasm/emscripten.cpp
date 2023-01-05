@@ -78,7 +78,7 @@ int transcribe(size_t index, const emscripten::val &audio, const std::string &la
             printf(text.c_str());
             printf("\n");
             result = text;
-            emscripten_run_script(("alert('" + text + "');").c_str());
+            emscripten_run_script(("alert(`" + text + "`);").c_str());
         });
     }
 
