@@ -2756,6 +2756,377 @@ static int whisper_wrap_segment(struct whisper_context * ctx, int max_len) {
     return res;
 }
 
+std::string whisper_full_text(
+        struct whisper_context * ctx,
+        struct whisper_full_params params,
+        const float * samples,
+        int n_samples) {
+    // clear old results
+    auto & result_all = ctx->result_all;
+
+    result_all.clear();
+
+    // compute log mel spectrogram
+    if (params.speed_up) {
+        if (whisper_pcm_to_mel_phase_vocoder(ctx, samples, n_samples, params.n_threads) != 0) {
+            fprintf(stderr, "%s: failed to compute log mel spectrogram\n", __func__);
+            return "";
+        }
+    } else {
+        if (whisper_pcm_to_mel(ctx, samples, n_samples, params.n_threads) != 0) {
+            fprintf(stderr, "%s: failed to compute log mel spectrogram\n", __func__);
+            return "";
+        }
+    }
+
+    // auto-detect language if not specified
+    if (params.language == nullptr || strlen(params.language) == 0 || strcmp(params.language, "auto") == 0) {
+        std::vector<float> probs(whisper_lang_max_id() + 1, 0.0f);
+
+        const auto lang_id = whisper_lang_auto_detect(ctx, 0, params.n_threads, probs.data());
+        if (lang_id < 0) {
+            fprintf(stderr, "%s: failed to auto-detect language\n", __func__);
+            return "";
+        }
+
+        params.language = whisper_lang_str(lang_id);
+
+        fprintf(stderr, "%s: auto-detected language: %s (p = %f)\n", __func__, params.language, probs[whisper_lang_id(params.language)]);
+    }
+
+    if (params.token_timestamps) {
+        ctx->t_beg = 0;
+        ctx->t_last = 0;
+        ctx->tid_last = 0;
+        ctx->energy = get_signal_energy(samples, n_samples, 32);
+    }
+
+    const int seek_start = params.offset_ms/10;
+    const int seek_end = seek_start + (params.duration_ms == 0 ? whisper_n_len(ctx) : params.duration_ms/10);
+
+    // if length of spectrogram is less than 1s (100 samples), then return
+    // basically don't process anything that is less than 1s
+    // see issue #39: https://github.com/ggerganov/whisper.cpp/issues/39
+    if (seek_end < 100 + seek_start) {
+        return 0;
+    }
+
+    // the accumulated text context so far
+    auto & prompt_past = ctx->prompt_past;
+    if (params.no_context) {
+        prompt_past.clear();
+    }
+
+    // prepend the prompt tokens to the prompt_past
+    if (params.prompt_tokens && params.prompt_n_tokens > 0) {
+        // parse tokens from the pointer
+        for (int i = 0; i < params.prompt_n_tokens; i++) {
+            prompt_past.push_back(params.prompt_tokens[i]);
+        }
+        std::rotate(prompt_past.begin(), prompt_past.end() - params.prompt_n_tokens, prompt_past.end());
+    }
+
+    // overwrite audio_ctx, max allowed is hparams.n_audio_ctx
+    if (params.audio_ctx > whisper_n_audio_ctx(ctx)) {
+        fprintf(stderr, "%s: audio_ctx is larger than the maximum allowed (%d > %d)\n", __func__, params.audio_ctx, whisper_n_audio_ctx(ctx));
+        return "";
+    }
+    ctx->exp_n_audio_ctx = params.audio_ctx;
+
+    // these tokens determine the task that will be performed
+    std::vector<whisper_token> prompt_init = { whisper_token_sot(ctx) };
+    if (whisper_is_multilingual(ctx)) {
+        const int lang_id = whisper_lang_id(params.language);
+        prompt_init.push_back(whisper_token_lang(ctx, lang_id));
+        if (params.translate) {
+            prompt_init.push_back(whisper_token_translate());
+        } else {
+            prompt_init.push_back(whisper_token_transcribe());
+        }
+    }
+
+    int progress_prev = 0;
+    int progress_step = 5;
+
+    std::vector<whisper_token_data> tokens_cur;
+    tokens_cur.reserve(whisper_n_text_ctx(ctx));
+
+    std::vector<whisper_token> prompt;
+    prompt.reserve(whisper_n_text_ctx(ctx));
+
+    // main loop
+    int seek = seek_start;
+    while (true) {
+        const int progress_cur = (100*(seek - seek_start))/(seek_end - seek_start);
+        while (progress_cur >= progress_prev + progress_step) {
+            progress_prev += progress_step;
+            if (params.print_progress) {
+                fprintf(stderr, "%s: progress = %3d%%\n", __func__, progress_prev);
+            }
+        }
+
+        // of only 1 second left, then stop
+        if (seek + 100 >= seek_end) {
+            break;
+        }
+
+        // if there is a very short audio segment left to process, we remove any past prompt since it tends
+        // to confuse the decoder and often make it repeat or hallucinate stuff
+        if (seek > seek_start && seek + 500 >= seek_end) {
+            prompt_past.clear();
+        }
+
+        if (params.encoder_begin_callback) {
+            if (params.encoder_begin_callback(ctx, params.encoder_begin_callback_user_data) == false) {
+                fprintf(stderr, "%s: encoder_begin_callback returned false - aborting\n", __func__);
+                break;
+            }
+        }
+
+        // encode audio features starting at offset seek
+        if (whisper_encode(ctx, seek, params.n_threads) != 0) {
+            fprintf(stderr, "%s: failed to encode\n", __func__);
+            return "";
+        }
+
+        int n_past = 0;
+        prompt.clear();
+
+        // if we have already generated some text, use it as a prompt to condition the next generation
+        if (!prompt_past.empty()) {
+            int n_take = std::min(std::min(params.n_max_text_ctx, whisper_n_text_ctx(ctx)/2), int(prompt_past.size()));
+
+            prompt = { whisper_token_prev(ctx) };
+            prompt.insert(prompt.begin() + 1, prompt_past.end() - n_take, prompt_past.end());
+
+            prompt_past.clear();
+            prompt_past.insert(prompt_past.end(), prompt.begin() + 1, prompt.end());
+        }
+
+        prompt.insert(prompt.end(), prompt_init.begin(), prompt_init.end());
+
+        int seek_delta = 100*WHISPER_CHUNK_SIZE;
+
+        // print the prompt
+        //printf("\n\n");
+        //for (int i = 0; i < prompt.size(); i++) {
+        //    printf("%s: prompt[%d] = %s\n", __func__, i, ctx->vocab.id_to_token[prompt[i]].c_str());
+        //}
+        //printf("\n\n");
+
+        // the accumulated transcription in the current interation
+        int result_len = 0;
+        tokens_cur.clear();
+
+        bool failed = false;
+        bool has_ts = false; // have we already sampled a non-beg timestamp token for the current segment?
+
+        for (int i = 0, n_max = whisper_n_text_ctx(ctx)/2 - 4; i < n_max; ++i) {
+            if (whisper_decode(ctx, prompt.data(), prompt.size(), n_past, params.n_threads) != 0) {
+                fprintf(stderr, "%s: failed to decode\n", __func__);
+                return "";
+            }
+
+            n_past += prompt.size();
+            prompt.clear();
+
+            // very basic greedy sampling strategy:
+            //
+            //   - always take the most probable token
+            //
+            // more sophisticated sampling strategies could be implemented here, but we keep it simple
+            // feel free to experiment!
+            //
+            {
+                const auto token = (i == 0) ? whisper_sample_timestamp(ctx, true) : whisper_sample_best(ctx);
+
+                // timestamp token - update sliding window
+                if (token.id > whisper_token_beg(ctx)) {
+                    const int seek_delta_new = 2*(token.id - whisper_token_beg(ctx));
+
+                    // do not allow to go back in time
+                    if (has_ts && seek_delta > seek_delta_new && result_len < i) {
+                        break;
+                    }
+
+                    seek_delta = seek_delta_new;
+                    result_len = i + 1;
+                    has_ts = true;
+                }
+
+                // add it to the context
+                prompt.push_back(token.id);
+                tokens_cur.push_back(token);
+
+                //{
+                //    const auto tt = token.pt > 0.10 ? ctx->vocab.id_to_token[token.tid] : "[?]";
+                //    printf("%s: %3d %10s %6d %6.3f '%s'\n", __func__, i, tt.c_str(), token.id, token.pt, ctx->vocab.id_to_token[token.id].c_str());
+                //}
+
+                // end of segment
+                if (token.id == whisper_token_eot(ctx) ||                // end of text token
+                    (params.max_tokens > 0 && i >= params.max_tokens) || // max tokens per segment reached
+                    (has_ts && seek + seek_delta + 100 >= seek_end)      // end of audio reached
+                    ) {
+                    if (result_len == 0) {
+                        if (seek + seek_delta + 100 >= seek_end) {
+                            result_len = i + 1;
+                        } else {
+                            failed = true;
+                            break;
+                        }
+                    }
+
+                    if (params.single_segment) {
+                        result_len = i + 1;
+                        seek_delta = 100*WHISPER_CHUNK_SIZE;
+                    }
+
+                    break;
+                }
+
+                // TESTS: if no tensors are loaded, it means we are running tests
+                if (ctx->model.n_loaded == 0) {
+                    seek_delta = 100*WHISPER_CHUNK_SIZE;
+                    break;
+                }
+            }
+
+            // sometimes, the decoding can get stuck in a repetition loop
+            // this is a simple strategy to avoid such cases - we simply flag the decoding as failed and advance
+            // the sliding window by 1 second
+            if (i == n_max - 1 && (result_len == 0 || seek_delta < 100*WHISPER_CHUNK_SIZE/2)) {
+                failed = true;
+                break;
+            }
+        }
+
+        if (failed) {
+            // when we fail to sample timestamp token, retry by clearing the past prompt
+            // if it fails again, then we advance the window by 1 second
+            if (!prompt_past.empty()) {
+                prompt_past.clear();
+            } else {
+                fprintf(stderr, "\n%s: failed to generate timestamp token - skipping one second\n\n", __func__);
+                seek += 100;
+            }
+            continue;
+        }
+
+        // shrink down to result_len
+        tokens_cur.resize(result_len);
+
+        for (const auto & r : tokens_cur) {
+            prompt_past.push_back(r.id);
+        }
+
+        // store the text from this iteration
+        if (!tokens_cur.empty()) {
+            int  i0 = 0;
+            auto t0 = seek + 2*(tokens_cur.front().tid - whisper_token_beg(ctx));
+
+            std::string text;
+
+            for (int i = 0; i < (int) tokens_cur.size(); i++) {
+                //printf("%s: %18s %6.3f %18s %6.3f\n", __func__,
+                //        ctx->vocab.id_to_token[tokens_cur[i].id].c_str(), tokens_cur[i].p,
+                //        ctx->vocab.id_to_token[tokens_cur[i].tid].c_str(), tokens_cur[i].pt);
+
+                if (params.print_special == false && tokens_cur[i].id >= whisper_token_eot(ctx)) {
+                } else {
+                    text += whisper_token_to_str(ctx, tokens_cur[i].id);
+                }
+                if (tokens_cur[i].id > whisper_token_beg(ctx) && !params.single_segment) {
+                    const auto t1 = seek + 2*(tokens_cur[i].tid - whisper_token_beg(ctx));
+                    if (!text.empty()) {
+                        const auto tt0 = params.speed_up ? 2*t0 : t0;
+                        const auto tt1 = params.speed_up ? 2*t1 : t1;
+
+                        if (params.print_realtime) {
+                            if (params.print_timestamps) {
+                                printf("[%s --> %s]  %s\n", to_timestamp(tt0).c_str(), to_timestamp(tt1).c_str(), text.c_str());
+                            } else {
+                                printf("%s", text.c_str());
+                                fflush(stdout);
+                            }
+                        }
+
+                        result_all.push_back({ tt0, tt1, text, {} });
+                        for (int j = i0; j <= i; j++) {
+                            result_all.back().tokens.push_back(tokens_cur[j]);
+                        }
+
+                        int n_new = 1;
+
+                        if (params.token_timestamps) {
+                            whisper_exp_compute_token_level_timestamps(
+                                    ctx, result_all.size() - 1, params.thold_pt, params.thold_ptsum);
+
+                            if (params.max_len > 0) {
+                                n_new = whisper_wrap_segment(ctx, params.max_len);
+                            }
+                        }
+                        if (params.new_segment_callback) {
+                            params.new_segment_callback(ctx, n_new, params.new_segment_callback_user_data);
+                        }
+                    }
+                    text = "";
+                    while (i < (int) tokens_cur.size() && tokens_cur[i].id > whisper_token_beg(ctx)) {
+                        i++;
+                    }
+                    i--;
+                    t0 = t1;
+                    i0 = i + 1;
+                }
+            }
+
+            if (!text.empty()) {
+                const auto t1 = seek + seek_delta;
+
+                const auto tt0 = params.speed_up ? 2*t0 : t0;
+                const auto tt1 = params.speed_up ? 2*t1 : t1;
+
+                if (params.print_realtime) {
+                    if (params.print_timestamps) {
+                        printf("[%s --> %s]  %s\n", to_timestamp(tt0).c_str(), to_timestamp(tt1).c_str(), text.c_str());
+                    } else {
+                        printf("%s", text.c_str());
+                        fflush(stdout);
+                    }
+                }
+
+                result_all.push_back({ tt0, tt1, text, {} });
+                for (int j = i0; j < (int) tokens_cur.size(); j++) {
+                    result_all.back().tokens.push_back(tokens_cur[j]);
+                }
+
+                int n_new = 1;
+
+                if (params.token_timestamps) {
+                    whisper_exp_compute_token_level_timestamps(
+                            ctx, result_all.size() - 1, params.thold_pt, params.thold_ptsum);
+
+                    if (params.max_len > 0) {
+                        n_new = whisper_wrap_segment(ctx, params.max_len);
+                    }
+                }
+                if (params.new_segment_callback) {
+                    params.new_segment_callback(ctx, n_new, params.new_segment_callback_user_data);
+                }
+            }
+        }
+
+        seek += seek_delta;
+    }
+
+		std::string text = "";
+		for (auto &result : result_all) {
+			text += result.text;
+		}
+		printf("FULL TRANSCRIPT: %s\n", text.c_str());
+    return text;
+}
+
 int whisper_full(
         struct whisper_context * ctx,
         struct whisper_full_params params,
@@ -3119,6 +3490,11 @@ int whisper_full(
         seek += seek_delta;
     }
 
+		std::string text = "";
+		for (auto &result : result_all) {
+			text += result.text;
+		}
+		printf("FULL TRANSCRIPT: %s\n", text.c_str());
     return 0;
 }
 
@@ -3207,6 +3583,7 @@ int whisper_full_parallel(
         params_cur.new_segment_callback = nullptr;
         params_cur.new_segment_callback_user_data = nullptr;
 
+				// pass in an empty callback function matching OnResult
         workers[i] = std::thread(whisper_full, &ctxs[i], std::move(params_cur), samples + start_samples, n_samples_cur);
     }
 

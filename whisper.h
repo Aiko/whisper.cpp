@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <string>
 
 #ifdef WHISPER_SHARED
 #    ifdef _WIN32
@@ -288,6 +289,17 @@ extern "C" {
             struct whisper_full_params   params,
                            const float * samples,
                                    int   n_samples);
+
+		// Run the entire model: PCM -> log mel spectrogram -> encoder -> decoder -> text
+		// Uses the specified decoding strategy to obtain the text.
+		// This function is the same as whisper_full() but passes the result to a callback.
+		typedef void (*OnResult)(std::string text);
+
+		WHISPER_API std::string whisper_full_text(
+										struct whisper_context * ctx,
+								struct whisper_full_params   params,
+															const float * samples,
+																			int   n_samples);
 
     // Split the input audio in chunks and process each chunk separately using whisper_full()
     // It seems this approach can offer some speedup in some cases.
